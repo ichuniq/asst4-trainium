@@ -69,7 +69,7 @@ def vector_add_tiled(a_vec, b_vec):
     M = a_vec.shape[0]
     
     # TODO: You should modify this variable for Step 1
-    ROW_CHUNK = 1
+    ROW_CHUNK = 128
 
     # Loop over the total number of chunks, we can use affine_range
     # because there are no loop-carried dependencies
@@ -104,7 +104,7 @@ def vector_add_stream(a_vec, b_vec):
     M = a_vec.shape[0]
 
     # TODO: You should modify this variable for Step 1
-    FREE_DIM = 2
+    FREE_DIM = 1000
 
     # The maximum size of our Partition Dimension
     PARTITION_DIM = 128
