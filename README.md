@@ -441,13 +441,22 @@ def vector_add_direct_allocation(a_vec, b_vec):
 
 **What you need to do:**
 1. Run the above `vector_add_direct_allocation` implementation on a vector size of 256000 and record the execution time in microseconds (μs). Now run `vector_add_stream` from Step 2 with *FREE_DIM=1000* on a vector size of 256000 and record the execution time in microseconds (μs).
-   
+   > a. `python vec_add.py —kernel alloc —size 256000`: Execution Time: 28 μs  
+     b. `python vec_add.py —kernel stream —size 256000`: Execution Time: 28 μs
+
     You should notice that the execution times are the same. This is because `vector_add_direct_allocation` manually performs the allocations that the Neuron compiler 
     automatically performs for `vector_add_stream`. Having the ability to perform manual allocations does not yield much benefit when performing vector addition as there is no 
-    data reuse and no need for engine paralelism. However, in other scenarios you will find that having more fine-grained control of memory allocations allows you to keep data on- 
+    data reuse and no need for engine parallelism. However, in other scenarios you will find that having more fine-grained control of memory allocations allows you to keep data on- 
     chip for as long as possible, as well as giving you the ability to perform different computations in parallel across multiple engines.
 2. How many physical tiles are allocated for each tensor? What is the problem if we set the number of physical tiles too large?
-3. Why should we have different offsets for each tensor? Try to run `vector_add_direct_allocation_bad` on a vector size of 256000. What is the result? Please provide a possible explanation.
+   > 4 tiles for each tensor, as specified in `FREE_DIM_TILES = 4`.
+     There will be a lot of empty space if the number of physical tiles is set too large, such as when it exceeds the logical tile size.
+     Such sparse data allocation can result in poor cache utilization and reduce the efficiency.
+
+4. Why should we have different offsets for each tensor? Try to run `vector_add_direct_allocation_bad` on a vector size of 256000. What is the result? Please provide a possible explanation.
+   > Result: Assertion Error. Correctness check failed.
+     If the offset is set to be the same for each tensor, it will essentially overwrite the previous allocation.
+   
 
 ## Part 2: Implementing a Fused Convolution - Max Pool Layer (70 points)
 
