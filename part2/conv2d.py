@@ -15,6 +15,8 @@ Parameters:
     W: the weights of the convolution filters.
     bias: the biases of the convolution filters.
     pool_size: the size of the pool filter and pool stride.
+Returns:
+    X_out: Output tensor [batch_size, out_channels, out_pool_height, out_pool_width]
 
 expect: X.shape == [batch_size, in_channels, input_height, input_width]
 expect: W.shape == [out_channels, in_channels, filter_height, filter_width]
@@ -31,6 +33,16 @@ out_pool_height = out_height // pool_size
 out_pool_width = out_width // pool_size
 
 The shape of the output should be [batch_size, out_channels, out_pool_height, out_pool_width]
+
+Map Convolution to a series of indenpendent Matmul
+- Reshape input X to: [in_channels, input_heigt*input_width], then multiplied it by each position of the filters,
+  where i and j respectively range from 0 to filter_height-1 and from 0 to filter_width-1.
+- Each filter slice has shape [out_channels, in_channels], and the resulting matrix multiplication contracts 
+  along the Input Channels dimension.
+- To align the input with each filter slice, the input must be shifted by an offset corresponding to the filter’s 
+  current position (i, j).
+- Put filter slice at LHS (stationary) and correspond shifted_X to RHS (moving)
+- Shape: [out_channels, in_channels] @ [in_channels, input_heigt*input_width] = [out_channels, input_heigt*input_width]
 
 """
 
@@ -64,15 +76,30 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         buffer=nl.hbm,
     )
 
+    # Reshape input X and W
+    # X = X.reshape((batch_size, in_channels, input_height * input_width))
+    # W = W.reshape((out_channels, in_channels, filter_height * filter_width))
+
+    # input_flat = X.shape[2]
+    # assert input_flat == input_height * input_width
+
     # Various tiling dimensions (You may want to define more of them)
-    c_in_pmax = nl.tile_size.pmax
-    n_tiles_c_in = in_channels // c_in_pmax
+    TILE_OC = 128  # out_channels tile size
+    TILE_K = nl.tile_size.pmax  # 128, in_channels tile size
+    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
+    # num_n_tiles = (input_flat + TILE_N - 1) // TILE_N
 
     # Process the images in batches
     for b in nl.affine_range(batch_size):
-        raise RuntimeError("Please fill your implementation of computing convolution"
-                           " of X[b] with the weights W and bias b, followed by a"
-                           " maxpool and store the result in X_out[b]")
+        for oc_tile in nl.affine_range(out_channels // TILE_OC):
+            # Initialize a flat accumulator on PSUM
+            res_psum = nl.zeros((TILE_OC, out_height * out_width), dtype=np.float32, buffer=nl.psum)
+
+            # TODO
+            
+            # Copy to SBUF and store
+            res_sbuf = nl.copy(res_psum, dtype=X.dtype)
+            nl.store(X_out[b, oc_tile*TILE_OC:(oc_tile+1)*TILE_OC, :, :], value=res_sbuf)
 
     return X_out
 
