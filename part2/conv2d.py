@@ -26,6 +26,9 @@ expect: pool_size == 1 || pool_size == 2
 expect: input_channels % 128 == 0
 expect: output_channels % 128 == 0
 
+** assume the size of the weights would always be such that it can completely fit inside SBUF.
+** assume (input_height - filter_height + 1) % pool_size == 0
+
 out_height = input_height - filter_height + 1
 out_width = input_width - filter_width + 1
 
@@ -43,6 +46,7 @@ Map Convolution to a series of indenpendent Matmul
   current position (i, j).
 - Put filter slice at LHS (stationary) and correspond shifted_X to RHS (moving)
 - Shape: [out_channels, in_channels] @ [in_channels, input_heigt*input_width] = [out_channels, input_heigt*input_width]
+- Accumulate this matmul result
 
 """
 
@@ -62,6 +66,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
     out_pool_height = out_height // pool_size
     out_pool_width = out_width // pool_size
+    N = out_height * out_width
     
     # Can assume multiple of 128 to avoid using mask
     assert in_channels % 128 == 0
@@ -84,22 +89,51 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     # assert input_flat == input_height * input_width
 
     # Various tiling dimensions (You may want to define more of them)
-    TILE_OC = 128  # out_channels tile size
+    TILE_M = 128  # out_channels tile size
     TILE_K = nl.tile_size.pmax  # 128, in_channels tile size
     TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-    # num_n_tiles = (input_flat + TILE_N - 1) // TILE_N
+
+    # Load weights into SBUF
+    W_sbuf = nl.load(W)
 
     # Process the images in batches
     for b in nl.affine_range(batch_size):
-        for oc_tile in nl.affine_range(out_channels // TILE_OC):
-            # Initialize a flat accumulator on PSUM
-            res_psum = nl.zeros((TILE_OC, out_height * out_width), dtype=np.float32, buffer=nl.psum)
+        # (temp) Load the entire input image for this batch into SBUF
+        X_batch = nl.load(X[b]) # [in_channels, input_height, input_width]
 
-            # TODO
+        # Initialize accumulator for the output in PSUM
+        res_psum = nl.zeros((out_channels, N), dtype=nl.float32, buffer=nl.psum)
+
+        # Loop over each filter position
+        for i in nl.affine_range(filter_height):
+            for j in nl.affine_range(filter_width):
+                # Get filter slice, shape: [out_channels, in_channels]
+                W_slice = W_sbuf[:, :, i, j]
+
+                # Get the corresponding X
+                X_shifted = nl.ndarray((in_channels, N), dtype=X.dtype, buffer=nl.sbuf)
+                for oh in nl.affine_range(out_height):
+                    for ow in nl.affine_range(out_width):
+                        linear_idx = oh * out_width + ow
+                        # Basic indexing to extract input value at shifted position
+                        X_shifted[:, linear_idx] = X_batch[:, oh + i, ow + j]
+
+                # Perform matmul
+                res_psum += nl.matmul(W_slice, X_shifted)
             
-            # Copy to SBUF and store
-            res_sbuf = nl.copy(res_psum, dtype=X.dtype)
-            nl.store(X_out[b, oc_tile*TILE_OC:(oc_tile+1)*TILE_OC, :, :], value=res_sbuf)
+
+        res_sbuf = nl.copy(res_psum)
+        bias_sbuf = nl.load(bias)
+        res_sbuf = nl.add(res_sbuf, bias_sbuf)
+
+        # Store to HBM using basic indexing (since can't reshape in sbuf)
+        out_sbuf = nl.ndarray((out_channels, out_height, out_width), dtype=X.dtype, buffer=nl.sbuf)
+        for oh in nl.affine_range(out_height):
+            for ow in nl.affine_range(out_width):
+                linear_idx = oh * out_width + ow
+                out_sbuf[:, oh, ow] = res_sbuf[:, linear_idx]
+            
+        nl.store(X_out[b], value=out_sbuf)
 
     return X_out
 
