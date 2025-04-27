@@ -3,6 +3,7 @@ import math
 
 import neuronxcc.nki as nki
 import neuronxcc.nki.language as nl
+from neuronxcc.nki.language import par_dim
 import neuronxcc.nki.isa as nisa
 from neuronxcc.nki import baremetal
 
@@ -66,6 +67,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
     out_pool_height = out_height // pool_size
     out_pool_width = out_width // pool_size
+
     N = out_height * out_width
     
     # Can assume multiple of 128 to avoid using mask
@@ -93,47 +95,74 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     TILE_K = nl.tile_size.pmax  # 128, in_channels tile size
     TILE_N = nl.tile_size.gemm_moving_fmax  # 512
 
-    # Load weights into SBUF
-    W_sbuf = nl.load(W)
+    # Calculate number of tiles
+    out_ch_n_tiles = out_channels // TILE_M
+    in_ch_n_tiles = in_channels // TILE_K
+
+    # Define indices for matmul result
+    ip_oc = nl.arange(TILE_M)[:, None]  # Output channels index (partition)
+    if_out = nl.arange(N)[None, :]  # Output pixels index (free)
 
     # Process the images in batches
     for b in nl.affine_range(batch_size):
-        # (temp) Load the entire input image for this batch into SBUF
-        X_batch = nl.load(X[b]) # [in_channels, input_height, input_width]
 
-        # Initialize accumulator for the output in PSUM
-        res_psum = nl.zeros((out_channels, N), dtype=nl.float32, buffer=nl.psum)
+        # For each out_channel tile
+        for m in nl.affine_range(out_ch_n_tiles):
+            # Initialize result accumulator for this output channel tile
+            res_psum = nl.zeros(
+                (par_dim(TILE_M), N),
+                dtype=np.float32, 
+                buffer=nl.psum
+            )
 
-        # Loop over each filter position
-        for i in nl.affine_range(filter_height):
-            for j in nl.affine_range(filter_width):
-                # Get filter slice, shape: [out_channels, in_channels]
-                W_slice = W_sbuf[:, :, i, j]
+            # Load weights for this output channel tile
+            W_sbuf_tile = nl.load(W[m * TILE_M:(m + 1) * TILE_M])
 
-                # Get the corresponding X
-                X_shifted = nl.ndarray((in_channels, N), dtype=X.dtype, buffer=nl.sbuf)
+            # For each input channel tile
+            for k in nl.affine_range(in_ch_n_tiles):
+                # Prepare input patches for all filter positions
+                X_batch_tile = nl.load(
+                    X[b, k * TILE_K:(k + 1) * TILE_K, 
+                      :input_height,
+                      :input_width]
+                )
+
+                # Loop over each filter position
+                for i in nl.affine_range(filter_height):
+                    for j in nl.affine_range(filter_width):
+                        # Get filter slice for current (i,j), shape: [out_channels, in_channels]
+                        W_slice = W_sbuf_tile[:, k * TILE_K:(k + 1) * TILE_K, i, j]
+                        
+                        # Get the corresponding X
+                        X_patches = nl.ndarray((par_dim(TILE_K), N), dtype=X.dtype, buffer=nl.sbuf)
+
+                        # Extract the value for this patch row by row
+                        for oh in nl.affine_range(out_height):
+                            row_start = oh * out_width
+                            row_end = (oh + 1) * out_width
+                            X_patches[:, row_start:row_end] = X_batch_tile[:, oh + i, j:j + out_width]
+
+                        # Perform matmul
+                        res_psum[ip_oc, if_out] += nl.matmul(W_slice, X_patches)
+            
+            # Copy result to sbuf, [out_ch_tile_size, out_height * out_width]
+            res_sbuf = nl.copy(res_psum)
+
+            # Load bias for this output channel tile
+            bias_tile = nl.ndarray((par_dim(TILE_M), 1), dtype=bias.dtype, buffer=nl.sbuf)
+            bias_tile[:, 0] = nl.load(bias[m * TILE_M:(m + 1) * TILE_M])
+
+            res_sbuf = nl.add(res_sbuf, bias_tile)
+            
+            # Reshape to out_sbuf (since can't use .reshape in sbuf)
+            out_sbuf = nl.ndarray((TILE_M, out_height, out_width), dtype=X.dtype, buffer=nl.sbuf)
+            for oc in nl.affine_range(TILE_M):
                 for oh in nl.affine_range(out_height):
+                    row_start = oh * out_width
                     for ow in nl.affine_range(out_width):
-                        linear_idx = oh * out_width + ow
-                        # Basic indexing to extract input value at shifted position
-                        X_shifted[:, linear_idx] = X_batch[:, oh + i, ow + j]
-
-                # Perform matmul
-                res_psum += nl.matmul(W_slice, X_shifted)
+                        out_sbuf[oc, oh, ow] = res_sbuf[oc, row_start + ow]
             
-
-        res_sbuf = nl.copy(res_psum)
-        bias_sbuf = nl.load(bias)
-        res_sbuf = nl.add(res_sbuf, bias_sbuf)
-
-        # Store to HBM using basic indexing (since can't reshape in sbuf)
-        out_sbuf = nl.ndarray((out_channels, out_height, out_width), dtype=X.dtype, buffer=nl.sbuf)
-        for oh in nl.affine_range(out_height):
-            for ow in nl.affine_range(out_width):
-                linear_idx = oh * out_width + ow
-                out_sbuf[:, oh, ow] = res_sbuf[:, linear_idx]
-            
-        nl.store(X_out[b], value=out_sbuf)
+            nl.store(X_out[b, m * TILE_M:(m + 1) * TILE_M], value=out_sbuf)
 
     return X_out
 
