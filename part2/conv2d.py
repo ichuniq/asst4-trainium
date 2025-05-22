@@ -41,9 +41,9 @@ The shape of the output should be [batch_size, out_channels, out_pool_height, ou
 Map Convolution to a series of indenpendent Matmul
 - Reshape input X to: [in_channels, input_heigt*input_width], then multiplied it by each position of the filters,
   where i and j respectively range from 0 to filter_height-1 and from 0 to filter_width-1.
-- Each filter slice has shape [out_channels, in_channels], and the resulting matrix multiplication contracts 
+- Each filter slice has shape [out_channels, in_channels], and the resulting matrix multiplication contracts
   along the Input Channels dimension.
-- To align the input with each filter slice, the input must be shifted by an offset corresponding to the filter’s 
+- To align the input with each filter slice, the input must be shifted by an offset corresponding to the filter's
   current position (i, j).
 - Put filter slice at LHS (stationary) and correspond shifted_X to RHS (moving)
 - Shape: [out_channels, in_channels] @ [in_channels, input_heigt*input_width] = [out_channels, input_heigt*input_width]
@@ -115,41 +115,43 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     # Process the images in batches
     for b in nl.affine_range(batch_size):
 
-        # For each out_channel tile
-        for m in nl.affine_range(out_ch_n_tiles):
-
-            # Get bias for this output channel tile
-            bias_tile = nl.ndarray((TILE_M, 1), dtype=bias.dtype, buffer=nl.sbuf)
-            bias_tile[:, 0] = nl.copy(bias_tiles[:, m])
-
-            # Load weights for this output channel tile
-            W_tile = nl.copy(W_tiles[:, m, :, :])
+        # Process spatial tiles first
+        for hw in nl.affine_range(hw_n_tiles):
+            # Starting position for this spatial tile
+            start_h = hw * TILE_H
             
-            # Process spatial tiles
-            for hw in nl.affine_range(hw_n_tiles):
-                # Starting position for this spatial tile
-                start_h = hw * TILE_H
+            # Fixed input height for this tile including filter overlap
+            input_tile_height = TILE_H + filter_height - 1
+            
+            # Preload all input channel tiles for this spatial tile
+            X_batch_tile = nl.ndarray((in_ch_n_tiles, par_dim(TILE_K), input_tile_height, input_width),
+                                  dtype=X.dtype, buffer=nl.sbuf)
+            for k in nl.affine_range(in_ch_n_tiles):
+                # Use masking to handle boundary conditions
+                i_par, i_row, i_col = nl.mgrid[0:TILE_K, 0:input_tile_height, 0:input_width]
+                mask = (start_h + i_row) < input_height
+                X_batch_tile[k] = nl.load(
+                    X[b, k * TILE_K + i_par, start_h + i_row, i_col],
+                    mask=mask
+                )
+            
+            # Process output channel tiles
+            for m in nl.affine_range(out_ch_n_tiles):
+                # Get bias for this output channel tile
+                bias_tile = nl.ndarray((TILE_M, 1), dtype=bias.dtype, buffer=nl.sbuf)
+                bias_tile[:, 0] = nl.copy(bias_tiles[:, m])
+
+                # Load weights for this output channel tile
+                W_tile = nl.copy(W_tiles[:, m, :, :])
                 
                 # Initialize result accumulator for this spatial tile
-                res_psum = nl.zeros((TILE_M, TILE_HW), dtype=np.float32, buffer=nl.psum)
-
-                # For each input channel tile
-                for k in nl.affine_range(in_ch_n_tiles):
-                    # Prepare input patches for all filter positions
-                    # Ensure we don't read beyond input bounds
-                    in_end_h = start_h + TILE_H + filter_height - 1
-                    if in_end_h > input_height:
-                        in_end_h = input_height
-                        
-                    X_batch_tile = nl.load(
-                        X[b, k * TILE_K:(k + 1) * TILE_K,
-                          start_h:in_end_h,
-                          :input_width]
-                    )
-
-                    # Loop over each filter position
-                    for i in nl.affine_range(filter_height):
-                        for j in nl.affine_range(filter_width):
+                res_psum = nl.zeros((TILE_M, TILE_HW), dtype=nl.float32, buffer=nl.psum)
+                
+                # Loop over each filter position
+                for i in nl.affine_range(filter_height):
+                    for j in nl.affine_range(filter_width):
+                        # Process all input channel tiles for this filter position
+                        for k in nl.affine_range(in_ch_n_tiles):
                             # Get filter slice for current (i,j), shape: [out_channels, in_channels]
                             W_slice = W_tile[:, k * TILE_K:(k + 1) * TILE_K, i, j]
                             
@@ -162,7 +164,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                                     
                                 row_start = h * out_width
                                 row_end = (h + 1) * out_width
-                                X_patches[:, row_start:row_end] = X_batch_tile[:, h + i, j:j + out_width]
+                                X_patches[:, row_start:row_end] = X_batch_tile[k, :, h + i, j:j + out_width]
 
                             # Perform matmul
                             res_psum[ip_oc, if_out] += nl.matmul(W_slice, X_patches)
@@ -174,11 +176,13 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                 out_sbuf = nl.copy(res_psum.reshape((TILE_M, TILE_H, out_width)))
                 
                 # Store result for this spatial tile, ensuring don't write beyond output bounds
-                out_end_h = start_h + TILE_H
-                if out_end_h > out_height:
-                    out_end_h = out_height
-                    
-                nl.store(X_out[b, m * TILE_M:(m + 1) * TILE_M, start_h:out_end_h], value=out_sbuf[:, :out_end_h-start_h, :])
+                i_par, i_h, i_w = nl.mgrid[0:TILE_M, 0:TILE_H, 0:out_width]
+                mask = (start_h + i_h) < out_height
+                nl.store(
+                    X_out[b, m * TILE_M + i_par, start_h + i_h, i_w],
+                    value=out_sbuf,
+                    mask=mask
+                )
 
     return X_out
 
