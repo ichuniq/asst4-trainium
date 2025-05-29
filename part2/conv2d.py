@@ -120,7 +120,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
             # Starting position for this spatial tile
             start_h = hw * TILE_H
             
-            # Fixed input height for this tile including filter overlap
+            # Calculate needed input height for this tile (output height + filter overlap)
             input_tile_height = TILE_H + filter_height - 1
             
             # Preload all input channel tiles for this spatial tile
@@ -175,14 +175,43 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                 # Copy result to out_sbuf, size: [out_ch_tile_size, TILE_H, out_width]
                 out_sbuf = nl.copy(res_psum.reshape((TILE_M, TILE_H, out_width)))
                 
-                # Store result for this spatial tile, ensuring don't write beyond output bounds
-                i_par, i_h, i_w = nl.mgrid[0:TILE_M, 0:TILE_H, 0:out_width]
-                mask = (start_h + i_h) < out_height
-                nl.store(
-                    X_out[b, m * TILE_M + i_par, start_h + i_h, i_w],
-                    value=out_sbuf,
-                    mask=mask
-                )
+                # Apply maxpooling if pool_size > 1
+                if pool_size > 1:
+                    # Calculate number of pools in this tile
+                    tile_pool_h = TILE_H // pool_size
+                    
+                    # Create indices for maxpooling
+                    # [Output channels, Vertical pools, Rows within a pool, Horizontal pools, Columns within a pool]
+                    i_0, i_1, i_2, i_3, i_4 = nl.mgrid[0:TILE_M, 0:tile_pool_h, 0:pool_size, 0:out_pool_width, 0:pool_size]
+                    
+                    # Apply maxpooling by taking the maximum value in each pool
+                    # size: [TILE_M, tile_pool_h, out_pool_width]
+                    pooled_result = nl.max(
+                        out_sbuf[i_0, i_1 * pool_size + i_2, i_3 * pool_size + i_4],
+                        axis=[2, 4]  # Take max across rows and columns within each pool
+                    )
+
+                    pool_start_h = start_h // pool_size
+                    
+                    # Use mask to handle boundary conditions
+                    i_par, i_h, i_w = nl.mgrid[0:TILE_M, 0:tile_pool_h, 0:out_pool_width]
+                    mask = (pool_start_h + i_h) < out_pool_height
+                    
+                    nl.store(
+                        X_out[b, m * TILE_M + i_par, pool_start_h + i_h, i_w],
+                        value=pooled_result,
+                        mask=mask
+                    )
+                else:
+                    # Store convolution result for this spatial tile without pooling
+                    i_par, i_h, i_w = nl.mgrid[0:TILE_M, 0:TILE_H, 0:out_width]
+                    mask = (start_h + i_h) < out_height
+                    
+                    nl.store(
+                        X_out[b, m * TILE_M + i_par, start_h + i_h, i_w],
+                        value=out_sbuf,
+                        mask=mask
+                    )
 
     return X_out
 
